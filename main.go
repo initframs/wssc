@@ -1,103 +1,157 @@
 package main
 
 import (
-	"bufio"
-	"crypto/tls"
 	"encoding/json"
-	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/gorilla/websocket"
-	"golang.org/x/time/rate"
+	"github.com/initframs/vsic"
+	"github.com/pelletier/go-toml/v2"
 )
 
 type Config struct {
-	ListenAddr  string
-	VSICAddr    string
-	AllowedHost string
-	JWTSecret   string
-	RateLimit   int
+	ListenAddr string `toml:"listen_addr"`
+	VsicAddr   string `toml:"vsic_addr"`
+
+	JWTSecret string `toml:"jwt_secret"`
+	UseTLS    bool   `toml:"use_tls"`
+
+	TLSCert string `toml:"tls_cert"`
+	TLSKey  string `toml:"tls_key"`
+
+	MaxConnsPerIP int `toml:"max_conns_per_ip"`
 }
 
-func configPath() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config/wssc.conf")
-}
-
-func loadConfig(path string) (Config, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return Config{}, err
-	}
-	defer f.Close()
-
-	var lines []string
-	sc := bufio.NewScanner(f)
-
-	for sc.Scan() {
-		l := strings.TrimSpace(sc.Text())
-		if l == "" || strings.HasPrefix(l, "#") {
-			continue
-		}
-		lines = append(lines, l)
-	}
-
-	if len(lines) < 4 {
-		return Config{}, fmt.Errorf("need: listen, vsic, host, jwtsecret")
-	}
-
-	cfg := Config{
-		ListenAddr:  lines[0],
-		VSICAddr:    lines[1],
-		AllowedHost: lines[2],
-		JWTSecret:   lines[3],
-		RateLimit:   10,
-	}
-
-	if len(lines) >= 5 {
-		fmt.Sscanf(lines[4], "%d", &cfg.RateLimit)
-	}
-
-	return cfg, nil
-}
+var (
+	ipConns = map[string]int{}
+	mu      sync.Mutex
+)
 
 type Frame struct {
 	Type string `json:"type"`
 	Data string `json:"data"`
 }
 
+func frameToVsic(f Frame) (string, bool) {
+	switch f.Type {
+	case "hello":
+		if f.Data == "" {
+			return "", false
+		}
+		return "HELLO " + f.Data, true
+	case "msg":
+		if f.Data == "" {
+			return "", false
+		}
+		return "MSG " + f.Data, true
+	case "ping":
+		return "PING", true
+	case "bye":
+		return "BYE", true
+	default:
+		return "", false
+	}
+}
+
+func vsicToFrame(line string) Frame {
+	cmd, arg := vsic.ParseCommand(line)
+	switch cmd {
+	case "HELLO":
+		return Frame{Type: "hello", Data: arg}
+	case "MOTD":
+		return Frame{Type: "motd", Data: arg}
+	case "MSG":
+		return Frame{Type: "msg", Data: arg}
+	case "PONG":
+		return Frame{Type: "pong"}
+	case "CYA":
+		return Frame{Type: "cya"}
+	case "ERROR":
+		return Frame{Type: "error", Data: arg}
+	case "CONNECTED":
+		return Frame{Type: "connected"}
+	default:
+		return Frame{Type: "msg", Data: line}
+	}
+}
+
+func configPath() string {
+	return filepath.Join(os.Getenv("HOME"), ".config/wssc/wssc.conf")
+}
+
+func loadConfig() Config {
+	b, err := os.ReadFile(configPath())
+	if err != nil {
+		log.Fatal("config read error:", err)
+	}
+
+	var cfg Config
+	if err := toml.Unmarshal(b, &cfg); err != nil {
+		log.Fatal("invalid config:", err)
+	}
+
+	if cfg.MaxConnsPerIP <= 0 {
+		cfg.MaxConnsPerIP = 3
+	}
+
+	return cfg
+}
+
 func validateJWT(tokenStr, secret string) bool {
-	token, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
+	tok, err := jwt.Parse(tokenStr, func(t *jwt.Token) (any, error) {
 		return []byte(secret), nil
 	})
-	return err == nil && token.Valid
+	return err == nil && tok.Valid
+}
+
+func allowIP(ip string, max int) bool {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if ipConns[ip] >= max {
+		return false
+	}
+	ipConns[ip]++
+	return true
+}
+
+func releaseIP(ip string) {
+	mu.Lock()
+	defer mu.Unlock()
+	ipConns[ip]--
 }
 
 var upgrader = websocket.Upgrader{
+	ReadBufferSize:  4096,
+	WriteBufferSize: 4096,
+
 	CheckOrigin: func(r *http.Request) bool {
-		return true
+		return true // potentially will add checks later, but origin isnt trusted anyways
 	},
 }
 
-func handleWS(cfg Config) http.HandlerFunc {
+func handle(cfg Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 
-		// can be spoofed
-		if !strings.Contains(r.Host, cfg.AllowedHost) {
-			http.Error(w, "forbidden", http.StatusForbidden)
+		ip, _, _ := net.SplitHostPort(r.RemoteAddr)
+
+		if !allowIP(ip, cfg.MaxConnsPerIP) {
+			http.Error(w, "too many connections", http.StatusTooManyRequests)
 			return
 		}
+		defer releaseIP(ip)
 
 		auth := r.Header.Get("Authorization")
 		if !strings.HasPrefix(auth, "Bearer ") {
-			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			http.Error(w, "missing token", http.StatusUnauthorized)
 			return
 		}
 
@@ -108,101 +162,77 @@ func handleWS(cfg Config) http.HandlerFunc {
 
 		ws, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
-			log.Println("upgrade:", err)
 			return
 		}
 		defer ws.Close()
 
-		limiter := rate.NewLimiter(rate.Limit(cfg.RateLimit), cfg.RateLimit)
-
-		tcp, err := net.Dial("tcp", cfg.VSICAddr)
+		var conn net.Conn
+		conn, err = net.Dial("tcp4", cfg.VsicAddr)
 		if err != nil {
-			log.Println("tcp dial:", err)
+			log.Println(err)
 			return
 		}
-		defer tcp.Close()
+		defer conn.Close()
 
-		ws.SetReadLimit(4096)
-		ws.SetReadDeadline(time.Now().Add(30 * time.Second))
-		ws.SetPongHandler(func(string) error {
-			ws.SetReadDeadline(time.Now().Add(30 * time.Second))
-			return nil
+		vc := vsic.Wrap(conn, vsic.Config{
+			MaxMsgSize: 4096,
+			TimeoutSec: 120,
 		})
 
-		// ws to tcp
+		// ws to vsic
 		go func() {
-			defer tcp.Close()
-
 			for {
 				_, msg, err := ws.ReadMessage()
 				if err != nil {
 					return
 				}
 
-				if !limiter.Allow() {
-					continue
-				}
-
 				var f Frame
-				if err := json.Unmarshal(msg, &f); err != nil {
+				if json.Unmarshal(msg, &f) != nil {
 					continue
 				}
 
-				if f.Type != "msg" {
-					continue
+				if line, ok := frameToVsic(f); ok {
+					vc.WriteLine(line)
 				}
-
-				tcp.Write([]byte(f.Data + "\n"))
 			}
 		}()
 
-		// tcp to ws
-		sc := bufio.NewScanner(tcp)
-
-		for sc.Scan() {
-			line := sc.Text()
-
-			f := Frame{
-				Type: "msg",
-				Data: line,
-			}
-
-			b, _ := json.Marshal(f)
-
-			ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := ws.WriteMessage(websocket.TextMessage, b); err != nil {
+		// vsic to ws
+		for {
+			line, err := vc.ReadLine()
+			if err != nil {
 				return
 			}
-		}
 
-		if err := sc.Err(); err != nil {
-			log.Println("tcp:", err)
+			out, _ := json.Marshal(vsicToFrame(line))
+
+			ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			ws.WriteMessage(websocket.TextMessage, out)
 		}
 	}
 }
 
 func main() {
-	cfg, err := loadConfig(configPath())
-	if err != nil {
-		log.Fatal(err)
-	}
+	cfg := loadConfig()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/", handleWS(cfg))
+	mux.HandleFunc("/", handle(cfg))
 
 	server := &http.Server{
 		Addr:    cfg.ListenAddr,
 		Handler: mux,
-		TLSConfig: &tls.Config{
-			MinVersion: tls.VersionTLS12,
-		},
 	}
 
-	log.Println("listening:", cfg.ListenAddr)
-	log.Println("forwarding:", cfg.VSICAddr)
+	log.Println("wssc listening on", cfg.ListenAddr)
 
-	log.Fatal(server.ListenAndServeTLS(
-		"/etc/wssc/cert.pem",
-		"/etc/wssc/key.pem",
-	))
+	if cfg.UseTLS {
+		if cfg.TLSCert == "" || cfg.TLSKey == "" {
+			log.Fatal("tls enabled but cert/key missing")
+		}
+
+		log.Fatal(server.ListenAndServeTLS(cfg.TLSCert, cfg.TLSKey))
+	}
+
+	log.Fatal(server.ListenAndServe())
 }
