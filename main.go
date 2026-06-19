@@ -149,13 +149,19 @@ func handle(cfg Config) http.HandlerFunc {
 		}
 		defer releaseIP(ip)
 
-		auth := r.Header.Get("Authorization")
-		if !strings.HasPrefix(auth, "Bearer ") {
+		token := ""
+		if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+			token = strings.TrimPrefix(auth, "Bearer ")
+		} else if q := r.URL.Query().Get("token"); q != "" {
+			token = q
+		}
+
+		if token == "" {
 			http.Error(w, "missing token", http.StatusUnauthorized)
 			return
 		}
 
-		if !validateJWT(strings.TrimPrefix(auth, "Bearer "), cfg.JWTSecret) {
+		if !validateJWT(token, cfg.JWTSecret) {
 			http.Error(w, "invalid token", http.StatusUnauthorized)
 			return
 		}
