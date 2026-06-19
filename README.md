@@ -1,2 +1,2 @@
 # wssc
-minimal websocket -> socket converter
+wssc is a minimal secure websocket (wss) -> raw tcp/tls socket converter
